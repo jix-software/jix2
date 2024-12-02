@@ -1,0 +1,880 @@
+/*
+ * jix.prj
+ *
+ * Copyright (C) Henri Lesourd 2019.
+ *
+ *  This file is part of JIX.
+ *
+ *  JIX is free software: you can redistribute it and/or modify it under
+ *  the terms of the GNU Lesser General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  JIX is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Lesser General Public License for more details.
+ *
+ *  You should have received a copy of the GNU Lesser General Public License
+ *  along with JIX.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+program jix;
+
+// Imports
+require("../lib/jixlib.js");
+
+// Global variables & helper functions
+var DBG=False;
+function errstop() {
+  help(),error("");
+  chdir(CWD);
+}
+
+// Lists of files
+function frppath(S,PROJ) {
+  for (var P of project.$) {
+    if (strMatch(S,P.PATH+"*")) return S.replace(P.PATH,"$"+(P==PROJ?"":P.NAME));
+  }
+  return S;
+}
+var XFTProg="p",XFTLib="l",XFTMod="m",
+    XFTObj="o",XFTChunk="c";
+function fxftIsSrc(F) {
+  return F.xft==XFTProg || F.xft==XFTLib || F.xft==XFTMod;
+}
+function fxftIsObj(F) {
+  return F.xft==XFTObj;
+}
+function fxftIsChunk(F) {
+  return F.xft==XFTChunk;
+}
+function flstattrs(F) {
+  if (F.isNew && F.isToDel) error("flstattrs(1)");
+  return (F.isNew?"+":F.isDeleted?"-":F.isModified?"!":"_")+(F.isDirty?"~":"_")+(F.isToDel?"\\":"_");
+}
+function flst(F,PROJ) {
+  var RES=flstattrs(F)+(F.projsd?F.projsd:"_")+(F.xft?F.xft:"_")+" "
+         +frppath(F.dir+(F.dir==""?"":"/")+F.fname,PROJ)+" "+F.date.getTime();
+  if (isArray(F.val)) RES+=" <= "+txtsave(F.val,10,"|");
+  return RES;
+}
+function flstls(F,PROJ) {
+  var L=[];
+  function iter(D) {
+    if (!isArray(D) && !D.isDir) return;
+    if (!isArray(D)) D=D.val;
+    for (var F in D) if (D[F].isDir) iter(D[F]);
+                                else L.push(flst(D[F],PROJ));
+  }
+  iter(F);
+  if (!isArray(F) && !F.isDir) L.push(flst(F,PROJ));
+  return L;
+}
+function flstlls(LDIRS,PROJ) {
+  for (var ND in LDIRS) {
+    var S=flstls(LDIRS[ND],PROJ).join("\n");
+    out(ND+":\n");
+    out(S==""?"_":S),out("\n---\n");
+  }
+}
+function flstrd(D,MASK) {
+  if (!D.isDir) return;
+  D=D.val;
+  for (var F in D) if (D[F].isDir && strMatch(D[F].fname,MASK)) {
+    delete D[F];
+  }
+}
+function flstex(D,F) {
+  function cmpf(F1,F2) {
+  //out("Comparing "+F1.dir+"/"+F1.fname+" and "+F2.dir+"/"+F2.fname+" ..."),cr();
+    return F1.dir==F2.dir && F1.fname==F2.fname;
+  }
+  var RES=False;
+  function iter(D) {
+    if (!isArray(D)) if (D.isDir) D=D.val;
+                             else if (cmpf(D,F)) return RES=D;
+    for (var F2 in D) if (D[F2].isDir) { if (iter(D[F2])) return RES; }
+                                  else if (cmpf(F,D[F2])) return RES=D[F2];
+    return False;
+  }
+  if (isString(F)) F=vfileCreate(filePath(F),fileName0(F),0);
+  if (isArray(D)) for (D2 of D) { if (iter(D2)) break; }
+  else
+  if (isObject(D) && isUndefined(D.val)) for (ND in D) { if (iter(D[ND])) break; }
+                                    else iter(D);
+  return RES;
+}
+function flstrm(D,F) {
+  function iter(D) {
+    if (!isArray(D)) D=D.val;
+    for (var F2 in D) if (D[F2].isDir) iter(D[F2]);
+                                  else if (F.dir==D[F2].dir && F.fname==D[F2].fname) delete D[F2];
+  }
+  if (isArray(D)) for (D2 of D) iter(D2);
+  else
+  if (isObject(D) && isUndefined(D.val)) for (ND in D) iter(D[ND]);
+                                    else iter(D);
+}
+function flstmv(F,SRC,DEST) {
+  F.parent=Nil;
+  DEST.push(F);
+  flstrm(SRC,F);
+}
+function foreach_flst(D,F) {
+  function cmpf(F1,F2) {
+  //out("Comparing "+F1.dir+"/"+F1.fname+" and "+F2.dir+"/"+F2.fname+" ..."),cr();
+    return F1.dir==F2.dir && F1.fname==F2.fname;
+  }
+  var RES=False;
+  function iter(D) {
+    if (!isArray(D)) if (D.isDir) D=D.val;
+                             else F(D);
+    for (var F2 in D) if (D[F2].isDir) iter(D[F2]);
+                                  else F(D[F2]);
+  }
+  if (isArray(D)) for (D2 of D) iter(D2);
+  else
+  if (isObject(D) && isUndefined(D.val)) for (ND in D) iter(D[ND]);
+                                    else iter(D);
+}
+
+// Loading/saving project dependencies
+var LOCProj="$",
+    LOCBin="b",LOCLib="l",LOCSrc="s",
+    LOCData="d",LOCWeb="w",
+    LOCOther="o",LOCXtern="X";
+function pathdeps(F,PROJ,LOC) {
+  var FPATH;
+  if (isString(F)) FPATH=F;
+              else FPATH=F.dir+(F.dir==""?"":"/")+F.fname;
+  if (isString(LOC) && LOC==LOCXtern) {
+    if (!startsWith(FPATH,0,"?/")) error("pathdeps");
+    return substring(FPATH,2,length(FPATH));
+  }
+  if (length(PROJ)+1>length(FPATH) || !startsWith(FPATH,0,PROJ)) return FPATH;
+  FPATH=substring(FPATH,length(PROJ)+1,length(FPATH));
+  if (isString(LOC) && LOC!=LOCOther) {
+    if (startsWith(FPATH,0,"bin/")) FPATH=substring(FPATH,4,length(FPATH));
+    else
+    if (startsWith(FPATH,0,"lib/")) FPATH=substring(FPATH,4,length(FPATH));
+    else
+    if (startsWith(FPATH,0,"src/")) FPATH=substring(FPATH,4,length(FPATH));
+    else
+    if (startsWith(FPATH,0,"data/")) FPATH=substring(FPATH,5,length(FPATH));
+    else
+    if (startsWith(FPATH,0,"web/")) FPATH=substring(FPATH,4,length(FPATH));
+  }
+  return FPATH;
+}
+function flstname(F,PROJ,LOC) {
+  if (isString(F)) return '"'+F+'"';//error("flstname");//return F/*FIXME: remove this case asap*/;
+  else {
+    var LOC=F.projsd;
+    return (LOC?LOC:"_")+"|"+pathdeps(F,PROJ,LOC);
+  }
+}
+function flstdeps(F,PROJ,LOC,FULL) {
+  var RES=(LOC?LOC:"_")+(F.xft?F.xft:"_")+" "
+         +pathdeps(F,PROJ,LOC)+" "+F.date.getTime()+" "
+         +(F.from?flstname(F.from,PROJ):"_")+" "+(F.tname?F.tname:"_");
+  if (FULL) RES=flstattrs(F)+RES;
+  if (isArray(F.imports)) {
+    for (var G of F.imports) RES+=" "+flstname(G,PROJ);
+  }
+  if (isArray(F.symbs) && !empty(F.symbs)) {
+    RES+=" ;";
+    for (var S of F.symbs) RES+=" "+S;
+  }
+  return RES;
+}
+function locdeps(S) {
+  switch (S) {
+    case "PROJ": return LOCProj;
+    case "BIN": return LOCBin;
+    case "LIB": return LOCLib;
+    case "SRC": return LOCSrc;
+    case "DATA": return LOCData;
+    case "WEB": return LOCWeb;
+    case "OTHER": return LOCOther;
+  }
+  return Undefined;
+}
+function ulocdeps(S,INCONF) {
+  switch (S) {
+    case LOCProj: return "PROJ";
+    case LOCBin: return "BIN";
+    case LOCLib: return "LIB";
+    case LOCSrc: return "SRC";
+    case LOCData: return "DATA";
+    case LOCWeb: return "WEB";
+    case LOCOther: return INCONF?"PROJ":"OTHER";
+  }
+  error("ulocdeps");
+}
+function serializedeps(PROJ,DEPS) {
+  var L=[];
+  if (isUndefined(DEPS)) DEPS=PROJ.DEPS;
+  for (var ND in DEPS) for (var F of DEPS[ND]) {
+    L.push(flstdeps(F,PROJ.CONF.PROJ,F.projsd/*locdeps(ND)*/));
+  }
+  return L.join("\n");
+}
+function savedeps(PROJ) {
+  var TXT=serializedeps(PROJ,PROJ.DEPS);
+  fileWrite(PROJ.CONF.PROJ+"/.jix_deps",TXT+"\n");
+}
+function parseimpdep(NAME,PROJ,DEPS) {
+  var L=splitTrim(NAME,"|"),LOC=L[0],FI=False;
+  if (LOC==LOCXtern) LOC=LOCSrc;
+  LOC=ulocdeps(LOC,1)
+  var FNAME=PROJ.CONF[LOC]+"/"+L[1];
+  FI=flstex(DEPS,FNAME);
+  if (!FI) FI=vfileCreate("?",L[1],0),FI.projsd=LOCXtern;
+  return FI;
+}
+function parsefdeps(PROJ,S) {
+  var L=splitTrim(S," "),
+      F=vfileCreate("","",false);
+  var PATH=PROJ.CONF[ulocdeps(L[0][0],1)]+"/"+L[1];
+  F.dir=filePath(PATH);
+  F.fname=fileName0(PATH);
+  F.projsd=L[0][0];
+  F.xft=(L[0][1]=="_"?Undefined:L[0][1]);
+  D=new Date();
+  D.setTime(L[2]);
+  F.date=D;
+  F.from=L[3]=="_"?Undefined:L[3];
+  F.tname=L[4]=="_"?Undefined:L[4];
+  F.imports=[];
+  F.symbs=[];
+  var I=5;
+  while (I<length(L)) if (L[I]==";") { I++;break; }
+                                else F.imports.push(L[I]),I++;
+  while (I<length(L)) F.symbs.push(L[I]),I++;
+  return F;
+}
+function parsedeps(PROJ,TXT) {
+  var L=splitTrim(trim(TXT),"\n"),
+      DIRS={ PROJ:[],BIN:[],LIB:[],SRC:[],DATA:[],WEB:[],OTHER:[] };
+  for (var S of L) {
+    var F=parsefdeps(PROJ,S);
+    DIRS[ulocdeps(F.projsd,0)].push(F);
+  }
+  return DIRS;
+}
+function loaddeps(PROJ,SET) {
+  var TXT=fileRead(PROJ.CONF.PROJ+"/.jix_deps");
+  var DEPS=parsedeps(PROJ,TXT);
+  if (isDefined(SET)) PROJ.DEPS=DEPS; 
+  return DEPS;
+}
+
+// Extracting imports
+function tokisb(S) {
+  if (!isString(S) || length(S)==0) error("tokisb");
+  return S[0]=="#" || startsWith(S,0,"/*") || startsWith(S,0,"//") || charIsBlank(S[0]);
+}
+function tokskipb(L,I) {
+  if (!isArray(L)) error("tokskipb");
+  while (I<length(L)) if (tokisb(L[I])) I++; else break;
+  return I;
+}
+function parsexft(F) {
+  var RES=XFTChunk,
+      I=tokskipb(F.val,0);
+  if (F.val[I]=="program") RES=XFTProg;
+  if (F.val[I]=="library") RES=XFTLib;
+  if (F.val[I]=="package") RES=XFTMod;
+  return RES;
+}
+function xftname(F) {
+  var RES,I=tokskipb(F.val,0);
+  if (F.val[I]=="program" || F.val[I]=="library" || F.val[I]=="package") {
+    I=tokskipb(F.val,I+1);
+    if (I<length(F.val)) RES=F.val[I];
+    if (RES=="=") RES=trim(F.val[I+1],'"'); // FIXME: temporary hack
+  }
+  return RES;
+}
+var EXTI={ "prj":"js", "js":"js", "py":"py", "c":"c" },
+    EXTO={ "prj":"js", "js":"js", "py":"py", "c":"co", "csv":"db", "jxml":"html" },
+    EXTSCRIPT=[ "js", "py" ];
+function parseimp(F,PROJ,DEPS,NAME) {
+  var FNAME=PROJ.CONF.SRC+"/"+NAME+"."+EXTI[fileExt(F.fname)],
+      FI=flstex(DEPS,FNAME);
+  if (!FI) FI=vfileCreate("?",fileName0(FNAME),0),FI.projsd=LOCXtern;
+  return FI;
+}
+function parseimps(F,PROJ,DEPS/*FIXME: get rid of this parm ; should be able to fetch it directly from F*/) {
+  var L=F.val,RES=[];
+  if (isArray(L)) for (var I=0;I<length(L);I++) {
+    var S=L[I];
+    if (S=="import") {
+      I=tokskipb(L,I+1);
+      if (I<length(L)) RES.push(L[I]),I++;
+    }
+  }
+  L=RES;RES=[];
+  for (var NAME of L) {
+    var FI=parseimp(F,PROJ,DEPS,NAME);
+  //if (FI.projsd==LOCXtern) continue;//error("parseimps::file "+FNAME+" not found");
+    RES.push(FI);
+  }
+  return RES;
+}
+function parsetgt(F,PROJ,DEPS,NAME,LOC) {
+  if (F.xft!=XFTProg && F.xft!=XFTLib) error("parsetgt");
+  LOC=isDefined(LOC)?LOC:F.xft==XFTProg?LOCBin:LOCLib;
+  var FNAME=PROJ.CONF[ulocdeps(LOC)]+"/"+NAME+"."+EXTO[fileExt(F.fname)],
+      FI=flstex(DEPS,FNAME);
+  if (!FI) {
+    FI=vfileCreate(filePath(FNAME),fileName0(FNAME),0),FI.isNew=True;
+    DEPS[ulocdeps(LOC)].push(FI);
+  }
+  else {
+  //if (FI.xft!=XFTObj) error("File "+F.dir+"/"+F.fname+" overwrites "+FI.dir+"/"+FI.fname);
+    if (FI.projsd!=LOC) error("parsetgt(2)"); // Should never happen
+  }
+  FI.xft=XFTObj;
+  FI.projsd=LOC;
+  return FI;
+}
+
+// Loading a project
+var NODIRS=["scories","versions","work"], // TODO: get rid of that (1)
+    ROOTFILES=[".jix_deps","LICENSE.txt","README.txt","TODO.txt","BOOT.ini"]; // TODO: get rid of that (2)
+function loadp(PATH) {
+  var RES=project(PATH);
+//for (var P of project.$) out(pretty(P,"indent")),out("\n---\n");
+  var PROJ=dirRead(RES.PATH,"*",False),
+      BIN=dirRead(RES.CONF.BIN,"*",False),
+      LIB=dirRead(RES.CONF.LIB,"*",False),
+      SRC=dirRead(RES.CONF.SRC,["*.prj","*.js","*.c","*.py","*.jxml"],RES.CONF.SRC!=RES.PATH),
+      DATA=dirRead(RES.CONF.DATA,["*.csv","*.db"],False),
+      WEB=dirRead(RES.CONF.WEB,["*.jxml","*.html"],RES.CONF.WEB!=RES.PATH);
+  flstrd(PROJ,"*");
+  flstrd(BIN,"*");
+  flstrd(LIB,"*");
+  flstrd(DATA,"*");
+  flstrd(SRC,NODIRS);
+  flstrd(WEB,NODIRS);
+//out(pretty(PROJ,"indent")),cr();
+  var FSDIRS={ PROJ:PROJ,BIN:BIN,LIB:LIB,DATA:DATA,SRC:SRC,WEB:WEB },
+      DIRS={ PROJ:[],BIN:[],LIB:[],SRC:[],DATA:[],WEB:[],OTHER:[] };
+/*flstlls(FSDIRS,RES);
+  flstlls(DIRS,RES);*/
+  for (var ND in FSDIRS) {
+    var D=FSDIRS[ND];
+    if (D==PROJ) {
+      var L=[];
+      for (var F in D.val) if (!D.val[F].isDir && strMatch(D.val[F].fname,ROOTFILES)) {
+        L.push(D.val[F]);
+      }
+      for (F of L) {
+      //out("Moving "+F.dir+"/"+F.fname+" to "+ND),cr();
+        flstmv(F,FSDIRS,DIRS[ND]);
+      }
+    }
+    else
+    if (D.dir+"/"+D.fname!=RES.PATH) {
+    //out("Tagging "+D.dir+"/"+D.fname+" ...\n");
+      var L=[];
+      foreach_vfile(D,function (F) {
+        if (!F.isDir) L.push(F);
+      });
+      for (var F of L) {
+      //out("Moving "+F.dir+"/"+F.fname+" to "+ND),cr();
+        flstmv(F,FSDIRS,DIRS[ND]);
+      }
+    }
+    else {
+      var D2={ BIN:[],LIB:[],SRC:[],DATA:[],WEB:[] };
+      foreach_vfile(D,function (F) {
+        if (!F.isDir) {
+          var EXT=fileExt(F.fname);
+          if (EXT=="a" || EXT=="o" || EXT=="obj" || EXT=="dll" || EXT=="so") D2.LIB.push(F);
+          if (EXT=="c" || EXT=="prj") D2.SRC.push(F);
+          if (EXT=="xls" || EXT=="csv" || EXT=="csvh" || EXT=="db") D2.DATA.push(F);
+          if (EXT=="jxml"/*TODO: test if it's a lib or a page*/ || EXT=="html" || EXT=="css"
+           || EXT=="jpg" || EXT=="jpeg" || EXT=="gif" || EXT=="png") D2.WEB.push(F);
+        }
+      });
+      for (var ND in D2) for (var F of D2[ND]) {
+      //out("Moving "+F.dir+"/"+F.fname+" to "+ND),cr();
+        flstmv(F,FSDIRS,DIRS[ND]);
+      }
+    }
+  }
+  var OTHER=[];
+  for (var ND in FSDIRS) {
+    var D=FSDIRS[ND];
+    foreach_vfile(D,function (F) {
+      if (!F.isDir) OTHER.push(F);
+    });
+  }
+  for (var F of OTHER) {
+    if (!flstex(DIRS,F)) {
+    //out("Moving "+F.dir+"/"+F.fname+" to OTHER"),cr();
+      flstmv(F,FSDIRS,DIRS.OTHER);
+    }
+  }
+/*out("--------------\n");
+  flstlls(FSDIRS,RES);
+  out("==============\n");
+  flstlls(DIRS,RES);*/
+/*out(pretty(OTHER[0])),cr();
+  out(pretty(DIRS.OTHER)),cr();
+  outd(flstex(DIRS,OTHER[0])),cr();*/
+  if (fileExists(RES.CONF.PROJ+"/.jix_deps")) { // Load & propagate .jix_deps into DIRS
+    var DEPS=loaddeps(RES);
+  //out("-->\n");
+    foreach_flst(DIRS,function (F) {
+      F.isNew=True;
+      F.isDeleted=False;
+      F.isToDel=False;
+      F.isModified=False;
+      F.isDirty=False;
+    });
+    foreach_flst(DEPS,function (F) {
+      F.isNew=False;
+      F.isDeleted=!fileExists(F.dir+"/"+F.fname);
+      F.isToDel=False;
+      var G=flstex(DIRS,F);
+      if (G) F.isModified=G.isModified=F.date.getTime()!=G.date.getTime();
+        else F.isModified=False; // Case reached in case isDeleted==True
+      F.isDirty=False;
+    });
+  /*out("!~\\^t"),cr();
+    foreach_flst(DEPS,function (F) {
+      out(flstdeps(F,RES.CONF.PROJ,"?",1)),cr();
+    });*/
+    foreach_flst(DIRS,function (F) {
+      var G=flstex(DEPS,F);
+      if (!G) return;
+      F.isNew=False;
+      if (!F.isModified) {
+        F.projsd=G.projsd;
+        F.xft=G.xft;
+        F.from=G.from;
+        F.tname=G.tname;
+        F.imports=G.imports;
+        F.symbs=G.symbs;
+      }
+    });
+  }
+  for (var ND in DIRS) for (var F of DIRS[ND]) {
+    if (isUndefined(F.projsd)) F.projsd=locdeps(ND);
+  }
+  for (var F of DIRS.SRC) if (F.isNew || F.isModified) { // Update metadata of new/modified files
+    out("  Loading "+F.dir+"/"+F.fname),cr();
+    F.val=load(F.dir+"/"+F.fname,1);
+    F.xft=parsexft(F);
+    if (fxftIsSrc(F)) {
+      F.tname=xftname(F);
+      F.imports=parseimps(F,RES,DIRS);
+    }
+    if (fileExt(F.fname)=="js" && F.xft!=XFTProg && F.xft!=XFTLib) F.symbs=[]; // TODO: see if we want to implement symb extraction or not
+  }
+  function setp(SD,EXTS) {
+    for (var F of DIRS[SD]) if (F.isNew || F.isModified) {
+      if (contains(EXTS,fileExt(F.fname))) {
+        F.xft=XFTProg;
+        F.tname=fileName(F.fname);
+      }
+    }
+  }
+  setp("DATA",["csv"]);
+  setp("DATA",["csvh"]);
+  setp("WEB",["jxml"]);
+  for (var F of DIRS.SRC) if (isArray(F.imports)) { // TODO: do also data & web
+    var L=[];
+    for (var FI of F.imports) {
+      if (isString(FI)) {
+        var NAME=FI;
+        FI=parseimpdep(NAME,RES,DIRS);
+        if (NAME[0]!=FI.projsd) F.isDirty=True;
+      }
+      if (FI) L.push(FI);
+    }
+    F.imports=L;
+  }
+  else F.imports=[]; // FIXME: make that better, vfile.imports should always be initialized to []
+  ; // decode froms in bin, lib, data and web
+  var NEWDIRT=True;
+  while (NEWDIRT) { // Mark all dirty files
+    NEWDIRT=False;
+    for (var F of DIRS.SRC) if (isArray(F.imports)) { // TODO: do also data & web
+      for (var FI of F.imports) {
+        if (isString(FI)) error("loadp::imports");
+        if ((fxftIsSrc(FI) || fxftIsChunk(FI)) && (FI.isModified || FI.isDirty || FI.isNew) && !F.isDirty) {
+          F.isDirty=True;
+          NEWDIRT=True;
+        }
+      }
+    }
+  }
+  function settgts(SD) {
+    for (var F of DIRS[SD]) if (contains([XFTProg,XFTLib],F.xft)) { // TODO: do also data & web
+      var NAME=F.tname;
+          FT=parsetgt(F,RES,DIRS,NAME,SD=="SRC"?Undefined:locdeps(SD));
+      F.tgt=FT;
+      FT.from=F;
+    }
+  }
+  settgts("SRC");
+  settgts("DATA");
+  settgts("WEB");
+  ; /* verifier qu'on n'a jamais:
+       => deux fichiers packages qui ont le meme nom (l'espace de noms des packages est plat) ;
+       => deux sources qui tapent dans la meme target ;
+       => deux targets qui ont le meme nom mais sont dans 2 dirs differents, genre bin et lib ;
+     */
+  OTHER=[];
+  for (var F of DIRS.OTHER) if (F.projsd!=LOCOther && F.projsd!=LOCXtern) { // TODO: test this
+    DIRS[ulocdeps(F.projsd,1)].push(F);
+  }
+  else OTHER.push(F);
+  DIRS.OTHER=OTHER;
+  OTHER=[];
+  for (var F of DIRS.OTHER) if (contains(EXTSCRIPT,fileExt(F.fname))) {
+    F.projsd=LOCLib;
+    DIRS.LIB.push(F);
+  }
+  else OTHER.push(F);
+  DIRS.OTHER=OTHER;
+  RES.DEPS=DIRS;
+  return RES;
+}
+
+// Generating expanded scripts
+function genscript(FS,FD,KEEP) {
+  var SKEBMEM=0,SKEBBUF=[];
+  function skebmem(START) {
+    if (START) SKEBBUF=[];
+    SKEBMEM=START;
+  }
+  function skeb(L,I) {
+    if (SKEBMEM) SKEBBUF.push(L[I]);
+    if (!charIsBlank(L[I][0])) L[I]=L[I][0]=="#"?"\n":""; // FIXME: add manageing << // ... <CR> >>, too
+  }
+  function tokskeb(L,I) {
+    while (I<length(L)) if (tokisb(L[I])) {
+      skeb(L,I);
+      I++;
+    }
+    else break;
+    return I;
+  }
+  function skebundo(L,I) {
+    for (var S of SKEBBUF) {
+      if (!(tokisb(S) && !charIsBlank(S[0]))) L[I]=S;
+      I++;
+    }
+  }
+  function fimp(F,NAME) {
+    for (var FI of F.imports) if (fileName(FI.fname)==NAME) return FI;
+    return Nil;
+  }
+  function minify(F) { // TODO: complete minifier ; difficult to do due to the JS rule of omitting ";" when CR ; problem, it's difficult to detect, for example << if (A) { } B; >> is correct, while << var F=function () { A; } B; >> is not (supposing that snippets come after e.g. << var A=1,B=2; >>.
+    var L=F.val,I=tokskeb(L,0);
+    if (L[I]=="program" || L[I]=="library" || L[I]=="package") {
+      L[I]="";
+      I=tokskeb(L,I+1);
+      if (I<length(L) && L[I]=="=") L[I]="",I=tokskeb(L,I+1); // FIXME: temporary hack
+      if (I<length(L)) L[I]="",I++;
+      I=tokskeb(L,I);
+      if (I<length(L) && L[I]==";") L[I]="",I++;
+      I=tokskeb(L,I);      
+    }
+    while (I<length(L)) {
+      I=tokskeb(L,I);
+      if (L[I]=="import") {
+        var I0=I;
+        skebmem(1),skeb(L,I);
+        I=tokskeb(L,I+1);
+        if (I<length(L) && !charIsAlpha(L[I])) error("minify::import<"+L[I]+">");
+        var NAME;
+        if (I<length(L)) NAME=L[I],skeb(L,I),I=tokskeb(L,I+1);
+        if (I<length(L) && L[I]==";") skeb(L,I),I++;
+        skebmem(0);
+        if (contains([LOCXtern,LOCOther],fimp(F,NAME).projsd)) skebundo(L,I0);
+        I=tokskeb(L,I);
+      }
+      else I++;
+    }
+    F.isMinified=True;
+  }
+  function loadimps(F) {
+    if (F.projsd!=LOCXtern && F.projsd!=LOCOther) {
+      if (!isArray(F.val)) F.val=load(F.dir+"/"+F.fname,1);
+      if (!F.isMinified) minify(F);
+      for (var FI of F.imports) loadimps(FI);
+    }
+  }
+  loadimps(FS);
+  var RES=[];
+  function generate(L,F) {
+    if (F.projsd!=LOCXtern && F.projsd!=LOCOther) {
+      for (var FI of F.imports) generate(L,FI);
+      splice(L,length(L),0,F.val);
+    }
+  }
+  generate(RES,FS);
+  return txtsave(RES);
+}
+
+// Commands
+function checkisproj(PROJ) {
+  if (!fileExists(PROJ)) error("Directory "+PROJ+" does not exists");
+  if (!fileExists(PROJ+"/.jix_deps")) {
+    error("Directory "+PROJ+" is not a jix project ; use 'jix init' to enable it");
+  }
+}
+function initproj(PROJ) {
+  if (!fileExists(PROJ)) error("Directory "+PROJ+" does not exists");
+  if (!fileExists(PROJ+"/.jix_deps")) fileWrite(PROJ+"/.jix_deps","");
+}
+function importFrom(PROJS,PROJD,IMPORTS) {
+  if (PROJS==PROJD) return;
+  build(PROJS);
+  out("Importing "+fileName(PROJS.CONF.PROJ)+" to "+fileName(PROJD.CONF.PROJ)+" ...\n");
+  var DIDWORK=False;
+  for (var FS of PROJS.DEPS.LIB) if (fileExists(FS.dir+"/"+FS.fname)/*FIXME: hack*/) {
+    var FD=False;
+    for (var F of PROJD.DEPS.LIB) {
+      if (F.fname==FS.fname) { FD=F;break; }
+    }
+    if (FS.isNew || FS.isModified || FS.isDirty
+     || !FD || FD && FD.date.getTime()<FS.date.getTime()) // FIXME: there will be an error when !FD
+    {
+      if (!FD.fname) continue;
+      out("  Importing "+pathdeps(FS,PROJS.CONF.PROJ)+" to "
+                        +pathdeps(PROJD.CONF.LIB+"/"+FD.fname,PROJD.CONF.PROJ)+" ..."),cr();
+      fileWrite(PROJD.CONF.LIB+"/"+FD.fname,fileRead(FS.dir+"/"+FS.fname));
+      DIDWORK=True;
+    }
+  }
+  if (!DIDWORK) out("  Nothing to be done."),cr();
+}
+function build(PROJ,VERBOSE) {
+  if (isString(PROJ)) PROJ=project(PROJ);
+  PROJ=loadp(PROJ.CONF.PROJ);
+  importFrom(project.JIXPROJ,PROJ,["jixlib.js","jixweb.js"]); // FIXME: improve this to import first, all files in lib, and then, only the public objects (in lib and in bin)
+  out("Building "+fileName(PROJ.CONF.PROJ)+" ...\n");
+/*var DIRS=loaddeps(PROJ);
+  flstlls(DIRS,RES);*/
+  if (VERBOSE) {
+    out("!~\\^t"),cr();
+    foreach_flst(PROJ.DEPS,function (F) {
+      out(flstdeps(F,PROJ.CONF.PROJ,F.projsd,1)),cr();
+    });
+  }
+; // delete the files that have been created by a file that doesn't exists anymore ; suppress such deps
+; // when a file that has been created is younger than all his froms, then its ok ; keep such a dep
+; // otherwise, delete the created file
+  var DIDWORK=False;
+  for (var F of PROJ.DEPS["DATA"]) {
+    var EXT=fileExt(F.fname);
+    if (EXT=="csvh") {
+      out("  Loading "+F.dir+"/"+F.fname),cr();
+      F.val=csvh.load(F.dir+"/"+F.fname);
+    }
+  }
+  for (var LOC of ["BIN","LIB","DATA","WEB"]) for (var F of PROJ.DEPS[LOC]) if (isDefined(F.from)) {
+    if (!isObject(F.from)) continue; // FIXME: hack ; situation happens when changing the name of a program or a library inside the file, for example (1)
+    var FS=F.from,EXT=fileExt(FS.fname);
+    if (FS.isNew || FS.isModified || FS.isDirty
+     || !fileExists(F.dir+"/"+F.fname)/*FIXME: hack ; should never happen*/
+     || fileExists(F.dir+"/"+F.fname) && F.date.getTime()<FS.date.getTime())
+    {
+      var DIDW=False;
+      if (contains(["prj","js","py","c","csv"/*,"jxml" FIXME: jxml disabled (1)*/],EXT)) {
+        out("  Generating "+pathdeps(F,PROJ.CONF.PROJ)+" ..."),cr();
+        DIDW=DIDWORK=True;
+      }
+      if (contains(["prj","js","py"],EXT)) {
+        var TXT=genscript(FS,F,1);
+        fileWrite(F.dir+"/"+F.fname,TXT);
+      }
+      if (fileExt(FS.fname)=="c") {
+        error("build::c !Yet");
+      }
+      if (fileExt(FS.fname)=="csv") {  // FIXME: replace that by PROJ.toDb()
+        var CSV=csv.load(FS.dir+"/"+FS.fname),
+            TXT=CSV.toDb();
+        fileWrite(F.dir+"/"+F.fname,TXT);
+      }
+      if (0/*,"jxml" FIXME: jxml disabled (2)*/ && fileExt(FS.fname)=="jxml") { // FIXME: replace that by PROJ.toHtml()
+        var S=fileRead(FS.dir+"/"+FS.fname),
+            TYRES=[],
+            TXT=jxml.toHtml(S,TYRES);
+        if (TYRES[0]!="html") error("build::jxml=>js !Yet");
+        fileWrite(F.dir+"/"+F.fname,TXT);
+      }
+      ; // effacer aussi l'ancienne target si elle est differente de la nouvelle
+      if (DIDW) F.date=new Date(),F.date.setTime(Date.now()); // FIXME: little glitch, here ; would be better to re-read the date of the written file ; otherwise with the isModified, in any case the obj file will be marked dirty
+    }
+  }
+  if (!DIDWORK) out("  Nothing to be done."),cr();
+; /* Voir plus tard le cas:
+     => ou il manque des packages externes, i.e. le cas ou il y a des noms de composants dont
+                           [ l'implementation ne peut etre trouvee, donc n'a pas ete importee ;
+     => ou il y a des interferences entre le nom des packages importes et le nom de packages
+                                   [ locaux (interdire ca ; ou alors, autoriser le masquage) ;
+     => des scripts appelles par un programme (qu'on pourrait decrire par un uses dans le
+                                                              [ code source du programme) ;
+   */
+  savedeps(PROJ);
+}
+
+function clean(PROJ) {
+  if (isString(PROJ)) PROJ=project(PROJ);
+  PROJ=loadp(PROJ.CONF.PROJ);
+  var DIDWORK=False;
+  for (var LOC of ["BIN","LIB","DATA","WEB"]) for (var F of PROJ.DEPS[LOC]) if (isDefined(F.from)) {
+    if (!isObject(F.from)) continue; // FIXME: hack ; situation happens when changing the name of a program  or a library inside the file, for example (2)
+    if (fileExists(F.dir+"/"+F.fname)) {
+      out("  Deleting "+pathdeps(F,PROJ.CONF.PROJ)+" ..."),cr();
+      fileDelete(F.dir+"/"+F.fname);
+      DIDWORK=True;
+    }
+  }
+  if (!DIDWORK) out("  Nothing to be done."),cr();
+  savedeps(PROJ);
+}
+function release() {
+; /* Copier les directories contenant des fichiers objet ou blob, avec leur contenu obj ou blob
+     [ dans le folder release (donc copier bin et lib, plus tout web, sauf les .jxml et autres
+     [ fichiers source du meme genre ; aussi data avec ses .db) */
+  error("jix release !Yet");
+}
+function install() {
+; // Copier tous les composants de bin et lib dans les bin et libs du JIXDIR le plus proche
+  error("jix install !Yet");
+}
+
+function serve(PROJ) {
+  if (!fileExists(PROJ)) error("Directory "+PROJ+" does not exists");
+  confInit(PROJ,True); // FIXME: find a better way, something like the name of a virtual .js file that can never actually exist in the filesystem
+  ; // FIXME: perhaps put a chdir() here ; in any case, solve the issue of which is the reference point for fetching files in the different parts of JIX (e.g. in server.start()), is it conf().XYZ, or either an avatar of cwd() ?
+  start();
+}
+function query() {
+  error("jix db !Yet");
+}
+function run(PROG,PARM) {
+  if (!fileExists(PROG)) error("File "+PROG+" does not exists");
+  if (!endsWith(PROG,".js")) error("File "+PROG+" is not a Javascript file");
+  if (isUndefined(PARM)) PARM=[];
+  if (!isArray(PARM)) error(pretty(PARM)+" is not a parameter list");
+  var RES=spawn("node",[PROG,...PARM],{stdio: [process.stdin, 'pipe', 'pipe']},1);
+  //out(RES),cr(); // TODO: display asynchronously the outputs
+  RES.stdout.on('data',S => {
+    out(Buffer.from(S).toString());
+  });
+  RES.stderr.on('data',S => {
+    out("ERROR::"+Buffer.from(S).toString());
+  });
+  RES.on('close',ERR => {
+  //console.log('Child exited with',ERR);
+  });
+}
+
+function help() {
+  out("Usage: jix [init|build|clean|release|install|server|db|run|help] [FILE|DIR]");
+}
+
+// Main
+var N=length(process.argv);
+if (N<2) errstop();
+
+var CWD=processCwd(),
+    IDIR=filePath(__filename),
+    JIXPATH=fileName(IDIR)=="bin"?filePath(IDIR):IDIR;
+    
+project.JIXPROJ=project(JIXPATH);
+var CMD=process.argv[2],PARM=[];
+
+if (N<3) errstop();
+for (var I=3;I<N;I++) PARM[I-3]=process.argv[I];
+N-=3;
+
+/*out("CMD="+CMD+"; PARM=");
+for (var I=0;I<length(PARM);I++) out(PARM[I]),out(" ");
+cr();*/
+
+var TOKINITJS=function () {
+//charnatSet("",CharNat);
+  tokenizeStart("( ) [ ] { } = : ,");
+};
+format("js",TOKINITJS);
+format("prj",TOKINITJS);
+var TOKINITPY=function () {
+  charnatSet("'",CharNatQuote);
+  tokenizeStart("( ) [ ] { } = : ,",1,1);
+};
+format("py",TOKINITPY);
+format("c",TOKINITJS);
+format("h",TOKINITJS);
+
+/*var A=load("src/jix.prj",1);
+out(pretty(A)),cr();
+save("RES",A);
+stop();*/
+
+if (CMD=="init" || CMD=="build" || CMD=="clean") {
+  var PROJ=".",BUILD;
+  if (N>2) errstop();
+  if (N>0) PROJ=PARM[0];
+  PROJ=fnameNormalize(PROJ);
+  PROJ=fileName(PROJ)=="src"?filePath(PROJ):PROJ; // FIXME: do it for all subdirs, and only if there is no .jix_deps ; perhaps look at a build.mf or at a boot.ini with a section [header] or [build], and if they dont exist, only run the build if -force is given
+  if (CMD=="init") initproj(PROJ);
+  else
+  if (CMD=="build") {
+    if (N>1) BUILD=fnameNormalize(PARM[1]);
+    checkisproj(PROJ);
+    build(PROJ);
+  }
+  else {
+    checkisproj(PROJ);
+    clean(PROJ);
+  } 
+}
+else
+if (CMD=="release") release();
+else
+if (CMD=="install") install();
+else
+if (CMD=="server") {
+  if (N!=1) errstop();
+  serve(fnameNormalize(PARM[0]));
+}
+else
+if (CMD=="db") query();
+else
+if (CMD=="help") help(),cr();
+else {
+  var PROG,PARM2=PARM;
+  if (CMD=="run") {
+  //if (N!=1) errstop();
+    PROG=PARM[0],PARM2=PARM.slice(1,length(PARM));
+  }
+  else {
+  //if (N!=0) errstop();
+    PROG=CMD;
+  }
+  function fjixlib(NAME) {
+    var LIB=JIXPATH+"/lib/"+NAME+".js";
+    if (!fileExists(LIB)) LIB=JIXPATH+"/bin/"+NAME+".js";
+    if (!fileExists(LIB)) LIB=JIXPATH+"/"+NAME+".js";
+    if (!fileExists(LIB)) LIB=Undefined;
+    return LIB;
+  }
+  var JIXLIB=fjixlib("jixlib");
+  if (!fileExists(JIXLIB)) JIXLIB=fjixlib("jixweb");
+  if (fileExists(JIXLIB)) process.env["JIXLIB"]=JIXLIB;
+  run(fnameNormalize(PROG),PARM2);
+}
+
+chdir(CWD);
